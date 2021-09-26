@@ -4,9 +4,28 @@ use wasm_bindgen::prelude::*;
 extern crate web_sys;
 
 // A macro to provide `println!(..)`-style syntax for `console.log` logging.
-macro_rules! log {
-    ( $( $t:tt )* ) => {
-        web_sys::console::log_1(&format!( $( $t )* ).into());
+// macro_rules! log {
+//     ( $( $t:tt )* ) => {
+//         web_sys::console::log_1(&format!( $( $t )* ).into());
+//     }
+// }
+
+use web_sys::console;
+
+pub struct Timer<'a> {
+    name: &'a str,
+}
+
+impl<'a> Timer<'a> {
+    pub fn new(name: &'a str) -> Timer<'a> {
+        console::time_with_label(name);
+        Timer { name }
+    }
+}
+
+impl<'a> Drop for Timer<'a> {
+    fn drop(&mut self) {
+        console::time_end_with_label(self.name);
     }
 }
 
@@ -37,27 +56,72 @@ pub struct Universe {
     width: u32,
     height: u32,
     cells: Vec<Cell>,
+    cells2: Vec<Cell>, // double buffering cells, avoid alloc and free per tick
+    generation: u32,
 }
-
 
 impl Universe {
     fn get_index(&self, row: u32, column: u32) -> usize {
-        (row *self.width+ column) as usize
+        (row * self.width + column) as usize
     }
 
     fn live_neighbor_count(&self, row: u32, column: u32) -> u8 {
+        // NOTE: modular operations is expensive
+        // let mut count = 0;
+        // for delta_row in [self.height - 1, 0, 1].iter().cloned() {
+        //     for delta_col in [self.width - 1, 0, 1].iter().cloned() {
+        //         if delta_row == 0 && delta_col == 0 {
+        //             continue;
+        //         }
+        //         let neighbor_row = (row + delta_row) % self.height;
+        //         let neighbor_col = (column + delta_col) % self.width;
+        //         let idx = self.get_index(neighbor_row, neighbor_col);
+        //         count += self.cells[idx] as u8;
+        //     }
+        // }
+        // count
         let mut count = 0;
-        for delta_row in [self.height-1, 0, 1].iter().cloned(){
-            for delta_col in [self.width-1, 0, 1].iter().cloned() {
-                if delta_row == 0 && delta_col == 0 {
-                    continue;
-                }
-                let neighbor_row = (row + delta_row) % self.height;
-                let neighbor_col = (column + delta_col) % self.width;
-                let idx = self.get_index(neighbor_row, neighbor_col);
-                count += self.cells[idx] as u8;
-            }
-        }
+
+        let north = if row == 0 { self.height - 1 } else { row - 1 };
+
+        let south = if row == self.height - 1 { 0 } else { row + 1 };
+
+        let west = if column == 0 {
+            self.width - 1
+        } else {
+            column - 1
+        };
+
+        let east = if column == self.width - 1 {
+            0
+        } else {
+            column + 1
+        };
+
+        let nw = self.get_index(north, west);
+        count += self.cells[nw] as u8;
+
+        let n = self.get_index(north, column);
+        count += self.cells[n] as u8;
+
+        let ne = self.get_index(north, east);
+        count += self.cells[ne] as u8;
+
+        let w = self.get_index(row, west);
+        count += self.cells[w] as u8;
+
+        let e = self.get_index(row, east);
+        count += self.cells[e] as u8;
+
+        let sw = self.get_index(south, west);
+        count += self.cells[sw] as u8;
+
+        let s = self.get_index(south, column);
+        count += self.cells[s] as u8;
+
+        let se = self.get_index(south, east);
+        count += self.cells[se] as u8;
+
         count
     }
 
@@ -78,8 +142,11 @@ impl Universe {
 /// Public methods, exported to JavaScript.
 #[wasm_bindgen]
 impl Universe {
+    pub fn gen(&self) -> u32 {
+        self.generation
+    }
     pub fn tick(&mut self) {
-        let mut next = self.cells.clone();
+        let _timer = Timer::new("Universe::tick");
         for row in 0..self.height {
             for col in 0..self.width {
                 let idx = self.get_index(row, col);
@@ -92,36 +159,40 @@ impl Universe {
                 //     cell,
                 //     live_neighbors
                 // );
-                let next_cell = match(cell, live_neighbors){
+                let next_cell = match (cell, live_neighbors) {
                     (Cell::Alive, x) if x < 2 || x > 3 => Cell::Dead,
                     (Cell::Alive, 2) | (Cell::Alive, 3) => Cell::Alive,
                     (Cell::Dead, 3) => Cell::Alive,
                     (otherwise, _) => otherwise,
                 };
                 //log!("      it becomes {:?}", next_cell);
-                next[idx] = next_cell;
+                self.cells2[idx] = next_cell;
             }
         }
-        self.cells = next
+        std::mem::swap(&mut self.cells, &mut self.cells2);
+        self.generation += 1;
     }
 
     pub fn new() -> Universe {
         utils::set_panic_hook();
         let width = 64;
         let height = 64;
-        let cells = (0..width*height)
+        let cells = (0..width * height)
             .map(|i| {
-                if i %2 == 0 || i % 7 == 0 {
+                if i % 2 == 0 || i % 7 == 0 {
                     Cell::Alive
                 } else {
                     Cell::Dead
                 }
             })
             .collect();
-        Universe{
+        let cells2 = (0..width * height).map(|_| Cell::Dead).collect();
+        Universe {
             width,
             height,
-            cells
+            cells,
+            cells2,
+            generation: 0,
         }
     }
 
@@ -141,7 +212,7 @@ impl Universe {
         self.cells.as_ptr()
     }
 
-    pub fn set_width(&mut self, width: u32){
+    pub fn set_width(&mut self, width: u32) {
         self.width = width;
         self.cells = (0..width * self.height).map(|_i| Cell::Dead).collect();
     }
@@ -156,19 +227,71 @@ impl Universe {
         self.cells[idx].toggle();
     }
 
-    pub fn reset(&mut self) {
+    pub fn random(&mut self) {
         let mut rng = rand::thread_rng();
-        
-        self.cells = (0..self.width*self.height)
+        self.cells = (0..self.width * self.height)
             .map(|i| {
-                // reset initialize state at top rows
-                if i > self.width && i < self.width*10 && i % (rng.gen_range(10..20)+1) == 0{
+                if i % (rng.gen_range(10..20) + 1) == 0 {
                     Cell::Alive
                 } else {
                     Cell::Dead
                 }
             })
             .collect();
+        self.generation = 1;
+    }
+    pub fn glider(&mut self) {
+        self.cells = (0..self.width * self.height)
+            .map(|i| {
+                if [
+                    0,
+                    self.width + 1,
+                    self.width + 2,
+                    self.width * 2,
+                    self.width * 2 + 1,
+                ]
+                .contains(&i)
+                {
+                    Cell::Alive
+                } else {
+                    Cell::Dead
+                }
+            })
+            .collect();
+        self.generation = 1;
+    }
+    pub fn pulsar(&mut self) {
+        self.cells = (0..self.width * self.height).map(|_| Cell::Dead).collect();
+        let first_row = (self.height - 11) / 2;
+        let first_col = (self.width - 11) / 2;
+        for row in first_row..first_row + 5 {
+            for col in first_col..first_col + 5 {
+                let i = row - first_row;
+                let j = col - first_col;
+                let cell = if i == 0 || i == 4 {
+                    if j > 0 && j < 4 {
+                        Cell::Alive
+                    } else {
+                        Cell::Dead
+                    }
+                } else {
+                    if j == 0 || j == 4 {
+                        Cell::Alive
+                    } else {
+                        Cell::Dead
+                    }
+                };
+                //up left
+                self.cells[(row * self.width + col) as usize] = cell;
+                //up right
+                self.cells[(row * self.width + col + 6) as usize] = cell;
+                // bottom left
+                self.cells[(row * self.width + col + 6 * self.width) as usize] = cell;
+                // bottom right
+                self.cells[(row * self.width + col + 6 * self.width + 6) as usize] = cell;
+            }
+        }
+        self.generation = 1;
     }
 }
 
@@ -185,4 +308,3 @@ impl fmt::Display for Universe {
         Ok(())
     }
 }
-
